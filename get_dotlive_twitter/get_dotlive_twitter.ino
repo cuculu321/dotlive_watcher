@@ -14,19 +14,39 @@
 #include <cassert>
 #include <locale>
 
-#include "private_data.h"
+#include <ESP32_LCD_ILI9341_SPI.h>
+#include <ESP32_SD_ShinonomeFNT.h>
+#include <ESP32_SD_UTF8toSJIS.h>
  
 WiFiMulti wifiMulti;
- 
+#include "private_data.h"
+
 #define SHA1_SIZE 20
  
 const char *base_host        = "api.twitter.com";
 const char *base_URL         = "https://api.twitter.com/1.1/trends/place.json";
 const char *base_URI         = "/1.1/trends/place.json";
 const int httpsPort           = 443;
- 
-String woeid = "23424856"; //WOEID ( Japan )
- 
+
+String woeid[] =      {"1110809", "1116753", "1117034", "1117099", "1117155", 
+                       "1117227", "1117502", "23424856","1117545", "1117605",
+                       "1117817", "1117881", "1118072", "1118108", "1118129",
+                       "1118285", "1118370", "1118550", "2345896", "15015370",
+                       "15015372", "90036018"};
+String woeid_name[] = {"北九州", "埼玉", "千葉", "福岡","浜松", 
+                       "広島", "川崎", "日本", "神戸", "熊本",
+                       "名古屋", "新潟", "相模原", "札幌", "仙台",
+                       "高松", "東京", "横浜", "沖縄", "大阪",
+                       "京都", "岡山"};
+
+int woeid_num = 7; //WOEID ( Japan ) Yahoo! Where On Earth IDから取得する
+
+const int woeid_size = sizeof(woeid_name) / sizeof(String);
+uint8_t woeid_buf[woeid_size][80][16] = {};
+uint16_t woeid_sj_length[woeid_size];
+
+#define Display_MaxData 10
+
 const char *key_http_method        = "GET";
 const char *key_consumer_key       = "oauth_consumer_key";
 const char *key_nonce              = "oauth_nonce";
@@ -38,6 +58,31 @@ const char *key_version            = "oauth_version";
 const char *key_signature          = "oauth_signature";
 const char *value_signature_method = "HMAC-SHA1";
 const char *value_version          = "1.0";
+
+const int8_t sck = 18; // SPI clock pin
+const int8_t miso = -1; // MISO(master input slave output) don't using
+const int8_t mosi = 23; // MOSI(master output slave input) pin
+const int8_t cs = 14; // Chip Select pin
+const int8_t dc = 27; // Data/Command pin
+const int8_t rst = 33; // Reset pin
+const int8_t LCD_LEDpin = 32;
+ 
+const uint8_t CS_SD = 4; //SD card CS ( Chip Select )
+  
+const char* UTF8SJIS_file = "/font/Utf8Sjis.tbl"; //UTF8 Shift_JIS 変換テーブルファイル名を記載しておく
+const char* Shino_Zen_Font_file = "/font/shnmk16.bdf"; //全角フォントファイル名を定義
+const char* Shino_Half_Font_file = "/font/shnm8x16.bdf"; //半角フォントファイル名を定義
+
+ESP32_LCD_ILI9341_SPI LCD(sck, miso, mosi, cs, dc, rst, LCD_LEDpin);
+ESP32_SD_ShinonomeFNT SFR(CS_SD, 40000000);
+  
+uint8_t trend_buf[Display_MaxData][80][16] = {};
+uint16_t trend_sj_length[Display_MaxData];
+  
+//red (0-31), green (0-63), blue (0-31)
+uint8_t red = 31, green = 63, blue = 31;
+uint8_t V_size = 1, H_size = 1;
+uint8_t num;
  
 //-------NTPサーバー時刻取得引数初期化-----------------------------
 IPAddress _NtpServerIP;
@@ -47,18 +92,25 @@ const int timeZone = 9;     // Tokyo
 WiFiUDP Udp;
 unsigned int localPort = 8888;  // local port to listen for UDP packets
 //--------------------------------------------------------
- 
-#define Display_MaxData 10
+
 String unicode_str[Display_MaxData];
 uint32_t LastTime = 0;
  
-//--------セットアップ関数--------------------------------
+//**********セットアップ関数************************
 void setup()
 {
   Serial.begin(115200);
   M5.begin();
   delay(100);
- 
+
+  SFR.SD_Shinonome_Init3F(UTF8SJIS_file, Shino_Half_Font_file, Shino_Zen_Font_file); //ライブラリ初期化。3ファイル同時に開く
+  LCD.ILI9341_Init(false, 40000000);
+  LCD.Display_Clear(0, 0, 319, 239);
+  LCD.Brightness(255); //LCD LED Full brightness
+
+  M5.Lcd.println("connecting ..");
+  M5.Lcd.println();
+  M5.Lcd.println(ssid);
   Serial.println();
   Serial.print(F("Connecting to "));
   Serial.println(ssid);
@@ -73,7 +125,14 @@ void setup()
       Serial.println(WiFi.localIP());
   }
   delay(1000);
- 
+  
+  //トレンドエリアの文字を作成--------------------------
+  LCD.Display_Clear(0, 0, 319, 239);
+  for(int i=0; i<woeid_size; i++){
+    woeid_sj_length[i] = SFR.StrDirect_ShinoFNT_readALL(woeid_name[i], woeid_buf[i]);
+  }
+  LCD.HVsizeUp_8x16_Font_DisplayOut(1, 1, woeid_sj_length[woeid_num], 150, 0, red, green, blue, woeid_buf[woeid_num]);
+  
   //NTPサーバーから時刻を取得---------------------------
   const char *NtpServerName = "time.windows.com";
   WiFi.hostByName(NtpServerName, _NtpServerIP);
@@ -86,31 +145,55 @@ void setup()
   Serial.println(now());
   delay(100);
  
-  Tweet_Get(); //ツイート取得
+  Tweet_Get(woeid[woeid_num]); //ツイート取得
   LastTime = millis();
 }
-//-------------メインループ-----------------------
+//**********メインループ**********************
 void loop(){
+   if(M5.BtnA.read()){
+    if(woeid_num > 0){
+      LCD.Display_Clear(0, 0, 319, 239);
+      woeid_num--;
+      LCD.HVsizeUp_8x16_Font_DisplayOut(1, 1, woeid_sj_length[woeid_num], 150, 0, red, green, blue, woeid_buf[woeid_num]);
+      Tweet_Get(woeid[woeid_num]);
+    }
+  }
+  if(M5.BtnB.read()){
+        LCD.Display_Clear(0, 0, 319, 239);
+        woeid_num = 7;
+        LCD.HVsizeUp_8x16_Font_DisplayOut(1, 1, woeid_sj_length[woeid_num], 150, 0, red, green, blue, woeid_buf[woeid_num]);
+        Tweet_Get(woeid[woeid_num]);
+    }
+  if(M5.BtnC.read()){
+    if(woeid_num < woeid_size-1){
+      LCD.Display_Clear(0, 0, 319, 239);
+      woeid_num++;
+      LCD.HVsizeUp_8x16_Font_DisplayOut(1, 1, woeid_sj_length[woeid_num], 150, 0, red, green, blue, woeid_buf[woeid_num]);
+      Tweet_Get(woeid[woeid_num]);
+    }
+  }
   if(millis() - LastTime > 180000){ //Tweet get every 3 minutes.
-    Tweet_Get(); //ツイート取得
+    LCD.Display_Clear(0, 0, 319, 239);
+    LCD.HVsizeUp_8x16_Font_DisplayOut(1, 1, woeid_sj_length[woeid_num], 150, 0, red, green, blue, woeid_buf[woeid_num]);
+    Tweet_Get(woeid[woeid_num]); //ツイート取得
     LastTime = millis();
   }
 }
-//---------------ツイート取得----------------------
-void Tweet_Get() {
+//**********ツイート取得************************
+void Tweet_Get(String woeid) {
   uint32_t value_timestamp  = now();
   uint32_t value_nonce      = 1111111111 + value_timestamp;
  
   Serial.println(F("--------------------------"));
   String status_all = "";
-  String parameter_str = make_parameter_str(status_all, value_nonce, value_timestamp);
+  String parameter_str = make_parameter_str(status_all, value_nonce, value_timestamp, woeid);
   String sign_base_str = make_sign_base_str(parameter_str);
   String oauth_signature = make_signature(consumer_secret, access_secret, sign_base_str);
-  String OAuth_header = make_OAuth_header(oauth_signature, value_nonce, value_timestamp);
+  String OAuth_header = make_OAuth_header(oauth_signature, value_nonce, value_timestamp, woeid);
  
   Serial.print(F("OAuth_header = "));
   Serial.println(OAuth_header);
-  TwitterAPI_HTTP_Request(base_host, OAuth_header, status_all);
+  TwitterAPI_HTTP_Request(base_host, OAuth_header, status_all, woeid);
    
   Serial.println(F("----------GET Twitter Trends Unicode ( UTF16 )-------------"));
   for(int i=0; i<Display_MaxData; i++){
@@ -118,15 +201,19 @@ void Tweet_Get() {
   }
  
   Serial.println(F("----------GET Twitter Trends Unicode ( UTF-8 )-------------"));
-
+  
+  red = 31; green = 63;  blue = 31;
+  H_size = 1, V_size = 1;
   for(int i=0; i<Display_MaxData; i++){
     Serial.println( UTF16toUTF8( unicode_str[i] ) );
-    const char* printdata = UTF16toUTF8( unicode_str[i]).c_str();
-    misakiPrint(0, i*10, printdata );
+    trend_sj_length[i] = SFR.StrDirect_ShinoFNT_readALL(UTF16toUTF8(unicode_str[i]), trend_buf[i]);
+    LCD.HVsizeUp_8x16_Font_DisplayOut(H_size, V_size, trend_sj_length[i], 0, i*20+30, red, green, blue, trend_buf[i]);
+    Serial.print(i);
+    Serial.println("is end");
   }
 }
-//----------------HTTP GET Request----------------------
-void TwitterAPI_HTTP_Request(const char* base_host, String OAuth_header, String status_all){
+//*************** HTTP GET Request***************************************
+void TwitterAPI_HTTP_Request(const char* base_host, String OAuth_header, String status_all, String woeid){
   WiFiClientSecure client;
  
   client.setCACert(root_ca);
@@ -200,8 +287,8 @@ void TwitterAPI_HTTP_Request(const char* base_host, String OAuth_header, String 
     Serial.println(F("connection failed"));
   }
 }
-//-----------------------------------------
-String make_parameter_str(String status_all, uint32_t value_nonce, uint32_t value_timestamp) {
+//*************************************************
+String make_parameter_str(String status_all, uint32_t value_nonce, uint32_t value_timestamp, String woeid) {
   String parameter_str = "id=" + woeid;
   parameter_str += "&";
   parameter_str += key_consumer_key;
@@ -231,7 +318,7 @@ String make_parameter_str(String status_all, uint32_t value_nonce, uint32_t valu
   Serial.println(parameter_str);
   return parameter_str;
 }
-//-----------------------------------------
+//*************************************************
 String make_sign_base_str(String parameter_str) {
   String sign_base_str = key_http_method;
   sign_base_str += "&";
@@ -242,7 +329,7 @@ String make_sign_base_str(String parameter_str) {
   Serial.println(sign_base_str);
   return sign_base_str;
 }
-//-----------------------------------------
+//*************************************************
 String make_signature(const char* secret_one, const char* secret_two, String sign_base_str) {
   String signing_key = URLEncode(secret_one);
   signing_key += "&";
@@ -265,8 +352,8 @@ String make_signature(const char* secret_one, const char* secret_two, String sig
   Serial.println(oauth_signature);
   return oauth_signature;
 }
-//-----------------------------------------
-String make_OAuth_header(String oauth_signature, uint32_t value_nonce, uint32_t value_timestamp) {
+//*************************************************
+String make_OAuth_header(String oauth_signature, uint32_t value_nonce, uint32_t value_timestamp, String woeid) {
   String OAuth_header = "OAuth ";
   OAuth_header += "id=\"";
   OAuth_header += woeid;
@@ -301,7 +388,7 @@ String make_OAuth_header(String oauth_signature, uint32_t value_nonce, uint32_t 
   OAuth_header += "\"";
   return OAuth_header;
 }
-//-----------------------------------------
+//*************************************************
 // Reference: http://hardwarefun.com/tutorials/url-encoding-in-arduino
 // modified by chaeplin
 String URLEncode(const char* msg) {
@@ -323,7 +410,7 @@ String URLEncode(const char* msg) {
   }
   return encodedMsg;
 }
-//-----------------------------------------
+//*************************************************
 //Reference: https://github.com/igrr/axtls-8266/blob/master/crypto/hmac.c
 //License axTLS 1.4.9 Copyright (c) 2007-2016, Cameron Rich
 void ssl_hmac_sha1(uint8_t *msg, int length, const uint8_t *key, int key_len, unsigned char *digest) {
@@ -352,7 +439,7 @@ void ssl_hmac_sha1(uint8_t *msg, int length, const uint8_t *key, int key_len, un
   mbedtls_sha1_update(&context, digest, SHA1_SIZE);
   mbedtls_sha1_finish(&context, digest);
 }
-//-------------Unicode ( UTF16 ) to UTF-8 convert-----------------------------------------
+//********** Unicode ( UTF16 ) to UTF-8 convert ********************************
 String UTF16toUTF8(String str){
   str.replace("\\u","\\");
   str += '\0';
@@ -390,12 +477,12 @@ String UTF16toUTF8(String str){
  
   return ret_str;
 }
-//----------------------------------------------------------------------------------
+//***********************************************************************
 std::string utf16_to_utf8(std::u16string const& src){
   std::wstring_convert<std::codecvt_utf8_utf16<char16_t>, char16_t> converter;
   return converter.to_bytes(src);
 }
-//---------------------------------- NTP Time -----------------------------------------
+//*********************** NTP Time **************************************
 time_t getNtpTime(){
   while (Udp.parsePacket() > 0) ; // discard any previously received packets
   Serial.println("Transmit NTP Request");
@@ -418,7 +505,7 @@ time_t getNtpTime(){
   Serial.println("No NTP Response :-(");
   return 0; // return 0 if unable to get the time
 }
-//-------------------------- NTP Time -----------------------------------------
+//*********************** NTP Time ************************************
 void sendNTPpacket(IPAddress &address){
   memset(packetBuffer, 0, NTP_PACKET_SIZE);
   packetBuffer[0] = 0b11100011;   // LI, Version, Mode
@@ -434,21 +521,3 @@ void sendNTPpacket(IPAddress &address){
   Udp.endPacket();
 }
 
-//-------------------- 日本語の描画 -----------------------------------------
-void misakiPrint(int x, int y, const char * pUTF8) {
-  int n=0;
-  byte buf[40][8];  //320x8ドットのバナー表示パターン
-  while(*pUTF8)
-    pUTF8 = getFontData(&buf[n++][0], pUTF8);  // フォントデータの取得
-
-  // 文字の描画
-  for (byte i=0; i < 8; i++) {
-    for (byte j=0; j < n; j++) {
-      for (byte k=0; k<8;k++) {
-        if(bitRead(buf[j][i],7-k)) {
-          M5.Lcd.drawPixel(x + 8*j + k , y + i, TFT_WHITE);
-        }
-      }
-    }
-  }
-}
